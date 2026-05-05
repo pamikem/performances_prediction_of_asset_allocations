@@ -1,0 +1,32 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "predict_perf_allocation"
+version = "0.0.1"
+description = "This project focuses on predicting the short-term performance of financial asset allocations using historical behavior data. Each allocation represents a dynamic portfolio strategy described by past returns, trading activity, and liquidity signals. The goal is to determine whether an allocation will yield a positive or negative return in the next period."
+authors = [
+  { name = "MDBB" },
+]
+license = { file = "LICENSE" }
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License"
+]
+requires-python = "~=3.11.0"
+
+
+[tool.ruff]
+line-length = 99
+src = ["predict_perf_allocation"]
+include = ["pyproject.toml", "predict_perf_allocation/**/*.py"]
+
+[tool.ruff.lint]
+extend-select = ["I"]  # Add import sorting
+
+[tool.ruff.lint.isort]
+known-first-party = ["predict_perf_allocation"]
+force-sort-within-sections = true
+

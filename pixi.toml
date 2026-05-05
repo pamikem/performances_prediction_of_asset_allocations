@@ -1,0 +1,26 @@
+[workspace]
+name = "performances_prediction_of_asset_allocations"
+description = "This project focuses on predicting the short-term performance of financial asset allocations using historical behavior data. Each allocation represents a dynamic portfolio strategy described by past returns, trading activity, and liquidity signals. The goal is to determine whether an allocation will yield a positive or negative return in the next period."
+version = "0.1.0"
+channels = ['conda-forge']
+platforms = ['linux-64', 'osx-64', 'osx-arm64', 'win-64']
+
+[dependencies]
+python = "3.11.*"
+ruff = "*"
+pip = "*"
+cmake = ">=4.3.2,<5"
+gcc = ">=15.2.0,<15.3"
+ninja = ">=1.13.2,<2"
+numpy = ">=2.4.3,<3"
+pandas = ">=3.0.2,<4"
+matplotlib = ">=3.10.9,<4"
+scikit-learn = ">=1.8.0,<2"
+jupyterlab = ">=4.5.7,<5"
+ipykernel = ">=7.2.0,<8"
+seaborn = ">=0.13.2,<0.14"
+lightgbm = ">=4.6.0,<5"
+
+[pypi-dependencies]
+python-dotenv = "*"
+predict_perf_allocation = { path = ".", editable = true }
