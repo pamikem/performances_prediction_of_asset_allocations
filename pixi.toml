@@ -20,6 +20,7 @@ jupyterlab = ">=4.5.7,<5"
 ipykernel = ">=7.2.0,<8"
 seaborn = ">=0.13.2,<0.14"
 lightgbm = ">=4.6.0,<5"
+numba = ">=0.65.1,<0.66"
 
 [pypi-dependencies]
 python-dotenv = "*"
