@@ -1,5 +1,6 @@
 from math import exp, log
-from numba import njit, prange, set_num_threads, get_num_threads
+
+from numba import njit, prange, set_num_threads
 import numpy as np
 
 set_num_threads(4)
@@ -104,21 +105,6 @@ def _pairwise_soft_dtw_symmetric(X, out, gamma, lambda_, rho):
 
         out[i, j] = R[m, m]
         out[j, i] = out[i, j]
-
-
-@njit(parallel=True)
-def _self_soft_dtw(X, out, gamma, lambda_, rho):
-    n_series = X.shape[0]
-    m = X.shape[1]
-
-    for i in prange(n_series):
-        D = np.empty((m, m), dtype=np.float64)
-        R = np.zeros((m + 2, m + 2), dtype=np.float64)
-
-        _squared_euclidean_distances(X[i], X[i], D, lambda_, rho)
-        _soft_dtw(D, R, gamma)
-
-        out[i] = R[m, m]
 
 
 @njit
@@ -232,6 +218,12 @@ def _check_rho(rho):
         raise ValueError("rho must be a finite non-negative value.")
 
 
+def _check_gamma(gamma):
+    if not np.isfinite(gamma) or gamma <= 0:
+        raise ValueError("gamma must be a finite positive value.")
+    return float(gamma)
+
+
 def _as_distance_matrix(D, lambda_=0.0, rho=0.0):
     D = np.asarray(D, dtype=np.float64)
 
@@ -275,8 +267,7 @@ class SoftDTW:
         self.R_ : array, shape = [m + 2, n + 2]
             Accumulated cost matrix (stored after calling `compute`).
         """
-        if gamma <= 0:
-            raise ValueError("gamma must be positive.")
+        gamma = _check_gamma(gamma)
         _check_lambda(lambda_)
         _check_rho(rho)
 
@@ -335,6 +326,7 @@ class SoftDTW:
 
     @classmethod
     def from_timeseries(cls, X, Y, gamma=1.0, lambda_=0.0, rho=0.0):
+        gamma = _check_gamma(gamma)
         dist = SquaredEuclidean(X, Y, lambda_=lambda_, rho=rho)
         obj = cls(dist.compute(), gamma=gamma)
         obj.distance_ = dist
@@ -343,7 +335,7 @@ class SoftDTW:
         return obj
 
     @classmethod
-    def pairwise(cls, X, Y=None, gamma=1.0, lambda_=1.0, rho=0.0, normalize=False):
+    def pairwise(cls, X, Y=None, gamma=1.0, lambda_=1.0, rho=0.0):
         """
         Compute soft-DTW between all pairs in one or two collections of sequences.
 
@@ -364,31 +356,20 @@ class SoftDTW:
         rho : float
             Finite non-negative penalty used for timestamp-pair feature
             distances that contain NaN or infinite values.
-        normalize : bool
-            If True, return the soft-DTW divergence:
-            sdtw(X, Y) - 0.5 * sdtw(X, X) - 0.5 * sdtw(Y, Y).
-            This has a zero diagonal when Y is omitted.
-
         Returns
         -------
         distances : array, shape = [n_x, n_y]
-            Pairwise soft-DTW divergence values if normalize is True, otherwise
-            raw soft-DTW values.
+            Pairwise raw soft-DTW values.
         """
-        if gamma <= 0:
-            raise ValueError("gamma must be positive.")
         _check_lambda(lambda_)
         _check_rho(rho)
+        gamma = _check_gamma(gamma)
 
         X = _as_collection(X)
 
         if Y is None:
             out = np.empty((X.shape[0], X.shape[0]), dtype=np.float64)
             _pairwise_soft_dtw_symmetric(X, out, gamma, lambda_, rho)
-            if normalize:
-                self_costs = np.diag(out).copy()
-                out -= 0.5 * self_costs[:, np.newaxis]
-                out -= 0.5 * self_costs[np.newaxis, :]
             return out
 
         Y = _as_collection(Y)
@@ -396,14 +377,6 @@ class SoftDTW:
 
         out = np.empty((X.shape[0], Y.shape[0]), dtype=np.float64)
         _pairwise_soft_dtw(X, Y, out, gamma, lambda_, rho)
-
-        if normalize:
-            x_self_costs = np.empty(X.shape[0], dtype=np.float64)
-            y_self_costs = np.empty(Y.shape[0], dtype=np.float64)
-            _self_soft_dtw(X, x_self_costs, gamma, lambda_, rho)
-            _self_soft_dtw(Y, y_self_costs, gamma, lambda_, rho)
-            out -= 0.5 * x_self_costs[:, np.newaxis]
-            out -= 0.5 * y_self_costs[np.newaxis, :]
 
         return out
 
