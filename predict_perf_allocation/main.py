@@ -10,6 +10,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import MinMaxScaler
 
 from predict_perf_allocation.svc import SVMTS
+from predict_perf_allocation.svr import SVMRegTS
 
 RET_COLS = [f"RET_{i}" for i in range(20, 0, -1)]
 VOL_COLS = [f"SIGNED_VOLUME_{i}" for i in range(20, 0, -1)]
@@ -50,8 +51,8 @@ def _fit_transform_column(df, col):
     return scaler.fit_transform(values), scaler
 
 
-def preprocess_data(X_train, y_train, X_test=None, drop_na=True):
-    """Scale model inputs and convert the training target to binary labels."""
+def preprocess_data(X_train, y_train, X_test=None, drop_na=True, use_svc=True):
+    """Scale model inputs and prepare the training target."""
     y_train = y_train.copy()
     X_train = X_train.copy()
     X_test = None if X_test is None else X_test.copy()
@@ -65,12 +66,10 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True):
     else:
         y_train = y_train.loc[X_train.index, TARGET_COL]
 
-    X_train.loc[:, RET_COLS], ret_scaler = _fit_transform_flattened_columns(X_train, RET_COLS)
     X_train.loc[:, VOL_COLS], vol_scaler = _fit_transform_flattened_columns(X_train, VOL_COLS)
     X_train.loc[:, [TURNOVER_COL]], turnover_scaler = _fit_transform_column(X_train, TURNOVER_COL)
 
     if X_test is not None:
-        X_test.loc[:, RET_COLS] = _transform_flattened_columns(X_test, RET_COLS, ret_scaler)
         X_test.loc[:, VOL_COLS] = _transform_flattened_columns(X_test, VOL_COLS, vol_scaler)
         X_test.loc[:, [TURNOVER_COL]] = turnover_scaler.transform(
             X_test[[TURNOVER_COL]].to_numpy(dtype=float)
@@ -81,7 +80,9 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True):
     X_train_ts = np.concatenate((X_train_ret, X_train_vol), axis=2)
     X_train_features = X_train[[TURNOVER_COL]].to_numpy(dtype=float)
     train_groups = X_train[GROUP_COL].to_numpy()
-    y_train_binary = (np.sign(y_train.to_numpy(dtype=float)) == 1).astype(int)
+    y_train_raw = y_train.to_numpy(dtype=float).ravel()
+    y_train_binary = _sign_labels(y_train_raw)
+    y_train_model = y_train_binary if use_svc else y_train_raw
 
     X_test_ts = None
     X_test_features = None
@@ -94,7 +95,6 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True):
         test_groups = X_test[GROUP_COL].to_numpy()
 
     scalers = {
-        "returns": ret_scaler,
         "volumes": vol_scaler,
         "turnover": turnover_scaler,
     }
@@ -102,7 +102,8 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True):
         "X_train_ts": X_train_ts,
         "X_train_features": X_train_features,
         "train_groups": train_groups,
-        "y_train": y_train_binary,
+        "y_train": y_train_model,
+        "y_train_raw": y_train_raw,
         "X_test_ts": X_test_ts,
         "X_test_features": X_test_features,
         "test_groups": test_groups,
@@ -110,20 +111,32 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True):
     }
 
 
-def fit_group_svms(X_train_ts, X_train_features, y_train, train_groups):
+def _model_params(use_svc):
+    if use_svc:
+        return SVM_PARAMS
+    return {key: value for key, value in SVM_PARAMS.items() if key != "random_state"}
+
+
+def fit_group_svms(X_train_ts, X_train_features, y_train, train_groups, use_svc=True):
     models = {}
     for group in sorted(np.unique(train_groups)):
         group_mask = train_groups == group
         group_y = y_train[group_mask]
 
-        if np.unique(group_y).size < 2:
+        if use_svc and np.unique(group_y).size < 2:
             logging.warning("Skipping group %s because it contains only one class.", group)
             continue
 
         group_X_ts = X_train_ts[group_mask]
         group_X_features = X_train_features[group_mask]
-        model = SVMTS(**SVM_PARAMS)
-        logging.info("Fitting SVM for group %s on %s rows.", group, group_X_ts.shape[0])
+        model_class = SVMTS if use_svc else SVMRegTS
+        model = model_class(**_model_params(use_svc))
+        logging.info(
+            "Fitting %s for group %s on %s rows.",
+            model_class.__name__,
+            group,
+            group_X_ts.shape[0],
+        )
         model.fit(group_X_ts, group_y, Xf=group_X_features)
         models[group] = model
 
@@ -134,7 +147,7 @@ def fit_group_svms(X_train_ts, X_train_features, y_train, train_groups):
 
 
 def predict_group_svms(models, X_ts, X_features, groups):
-    y_pred = np.empty(len(groups), dtype=int)
+    y_pred = np.empty(len(groups), dtype=float)
 
     for group in sorted(np.unique(groups)):
         if group not in models:
@@ -159,8 +172,16 @@ def _drop_rows_with_nans(X_train, y_train):
     return X_train.loc[rows_not_na].copy(), y_train.loc[rows_not_na].copy()
 
 
+def _sign_labels(values):
+    return (np.sign(np.asarray(values).ravel()) == 1).astype(int)
+
+
 def _binary_labels(y):
-    return (np.sign(y[TARGET_COL].to_numpy(dtype=float)) == 1).astype(int)
+    return _sign_labels(y[TARGET_COL].to_numpy(dtype=float))
+
+
+def _sign_accuracy(y_true, y_pred):
+    return accuracy_score(_sign_labels(y_true), _sign_labels(y_pred))
 
 
 def _cv_stratification_labels(X_train, y_binary):
@@ -214,7 +235,7 @@ def _group_accuracy_scores(y_true, y_pred, groups, prefix):
     scores = {}
     for group in sorted(np.unique(groups)):
         group_mask = groups == group
-        scores[f"{prefix}_accuracy_group_{group}"] = accuracy_score(
+        scores[f"{prefix}_accuracy_group_{group}"] = _sign_accuracy(
             y_true[group_mask],
             y_pred[group_mask],
         )
@@ -234,6 +255,7 @@ def _save_run_config(model_dir, run_args):
 
 def run_svm(
     model_name="svm_group_cv",
+    use_svc=True,
     drop_na=True,
     n_splits=2,
     random_state=42,
@@ -245,6 +267,7 @@ def run_svm(
         model_dir,
         {
             "model_name": model_name,
+            "use_svc": use_svc,
             "drop_na": drop_na,
             "n_splits": n_splits,
             "random_state": random_state,
@@ -283,13 +306,14 @@ def run_svm(
         fold_X_train = X_train.iloc[train_idx].copy()
         fold_y_train = y_train.iloc[train_idx].copy()
         fold_X_valid = X_train.iloc[valid_idx].copy()
-        fold_y_valid = y_binary[valid_idx]
+        fold_y_valid = y_train.iloc[valid_idx][TARGET_COL].to_numpy(dtype=float)
 
         data = preprocess_data(
             fold_X_train,
             fold_y_train,
             X_test=fold_X_valid,
             drop_na=drop_na,
+            use_svc=use_svc,
         )
         del fold_X_train, fold_y_train, fold_X_valid
         gc.collect()
@@ -299,6 +323,7 @@ def run_svm(
             data["X_train_features"],
             data["y_train"],
             data["train_groups"],
+            use_svc=use_svc,
         )
         train_pred = predict_group_svms(
             models,
@@ -312,10 +337,10 @@ def run_svm(
             data["X_test_features"],
             data["test_groups"],
         )
-        train_score = accuracy_score(data["y_train"], train_pred)
-        valid_score = accuracy_score(fold_y_valid, y_pred)
+        train_score = _sign_accuracy(data["y_train_raw"], train_pred)
+        valid_score = _sign_accuracy(fold_y_valid, y_pred)
         train_group_scores = _group_accuracy_scores(
-            data["y_train"],
+            data["y_train_raw"],
             train_pred,
             data["train_groups"],
             prefix="train",
@@ -366,4 +391,4 @@ def run_svm(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-    run_svm(n_rows_per_group=2000)
+    run_svm(model_name="svr_group", n_rows_per_group=2000, use_svc=False, n_splits=2)
