@@ -2,6 +2,7 @@ import gc
 import json
 import logging
 from pathlib import Path
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,6 @@ VOL_COLS = [f"SIGNED_VOLUME_{i}" for i in range(20, 0, -1)]
 TURNOVER_COL = "MEDIAN_DAILY_TURNOVER"
 GROUP_COL = "GROUP"
 TARGET_COL = "target"
-REQUIRED_FEATURE_COLS = RET_COLS + VOL_COLS + [TURNOVER_COL]
 SVM_PARAMS = {
     "C": 1.0,
     "soft_dtw_gamma": 0.1,
@@ -31,6 +31,7 @@ SVM_PARAMS = {
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 MODELS_DIR = PROJECT_ROOT / "models"
+SAMPLE_SUBMISSION_PATH = RAW_DATA_DIR / "sample_submission.csv"
 
 
 def _fit_transform_flattened_columns(df, cols):
@@ -51,14 +52,38 @@ def _fit_transform_column(df, col):
     return scaler.fit_transform(values), scaler
 
 
-def preprocess_data(X_train, y_train, X_test=None, drop_na=True, use_svc=True):
+def _feature_columns(k_last_days):
+    if k_last_days is None:
+        return RET_COLS, VOL_COLS
+    if not isinstance(k_last_days, int):
+        raise ValueError("k_last_days must be an integer between 1 and 20 or None.")
+    if not 1 <= k_last_days <= len(RET_COLS):
+        raise ValueError("k_last_days must be an integer between 1 and 20 or None.")
+    return RET_COLS[-k_last_days:], VOL_COLS[-k_last_days:]
+
+
+def _required_feature_cols(ret_cols, vol_cols):
+    return ret_cols + vol_cols + [TURNOVER_COL]
+
+
+def preprocess_data(
+    X_train,
+    y_train,
+    X_test=None,
+    drop_na=True,
+    use_svc=True,
+    ret_cols=None,
+    vol_cols=None,
+):
     """Scale model inputs and prepare the training target."""
+    ret_cols = RET_COLS if ret_cols is None else ret_cols
+    vol_cols = VOL_COLS if vol_cols is None else vol_cols
     y_train = y_train.copy()
     X_train = X_train.copy()
     X_test = None if X_test is None else X_test.copy()
 
     if drop_na:
-        rows_not_na = X_train[REQUIRED_FEATURE_COLS].notna().all(axis=1)
+        rows_not_na = X_train[_required_feature_cols(ret_cols, vol_cols)].notna().all(axis=1)
         dropped_rows = len(X_train) - rows_not_na.sum()
         y_train = y_train.loc[rows_not_na, TARGET_COL]
         X_train = X_train.loc[rows_not_na].copy()
@@ -66,17 +91,17 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True, use_svc=True):
     else:
         y_train = y_train.loc[X_train.index, TARGET_COL]
 
-    X_train.loc[:, VOL_COLS], vol_scaler = _fit_transform_flattened_columns(X_train, VOL_COLS)
+    X_train.loc[:, vol_cols], vol_scaler = _fit_transform_flattened_columns(X_train, vol_cols)
     X_train.loc[:, [TURNOVER_COL]], turnover_scaler = _fit_transform_column(X_train, TURNOVER_COL)
 
     if X_test is not None:
-        X_test.loc[:, VOL_COLS] = _transform_flattened_columns(X_test, VOL_COLS, vol_scaler)
+        X_test.loc[:, vol_cols] = _transform_flattened_columns(X_test, vol_cols, vol_scaler)
         X_test.loc[:, [TURNOVER_COL]] = turnover_scaler.transform(
             X_test[[TURNOVER_COL]].to_numpy(dtype=float)
         )
 
-    X_train_ret = X_train[RET_COLS].to_numpy(dtype=float)[:, :, np.newaxis]
-    X_train_vol = X_train[VOL_COLS].to_numpy(dtype=float)[:, :, np.newaxis]
+    X_train_ret = X_train[ret_cols].to_numpy(dtype=float)[:, :, np.newaxis]
+    X_train_vol = X_train[vol_cols].to_numpy(dtype=float)[:, :, np.newaxis]
     X_train_ts = np.concatenate((X_train_ret, X_train_vol), axis=2)
     X_train_features = X_train[[TURNOVER_COL]].to_numpy(dtype=float)
     train_groups = X_train[GROUP_COL].to_numpy()
@@ -88,8 +113,8 @@ def preprocess_data(X_train, y_train, X_test=None, drop_na=True, use_svc=True):
     X_test_features = None
     test_groups = None
     if X_test is not None:
-        X_test_ret = X_test[RET_COLS].to_numpy(dtype=float)[:, :, np.newaxis]
-        X_test_vol = X_test[VOL_COLS].to_numpy(dtype=float)[:, :, np.newaxis]
+        X_test_ret = X_test[ret_cols].to_numpy(dtype=float)[:, :, np.newaxis]
+        X_test_vol = X_test[vol_cols].to_numpy(dtype=float)[:, :, np.newaxis]
         X_test_ts = np.concatenate((X_test_ret, X_test_vol), axis=2)
         X_test_features = X_test[[TURNOVER_COL]].to_numpy(dtype=float)
         test_groups = X_test[GROUP_COL].to_numpy()
@@ -165,8 +190,35 @@ def predict_group_svms(models, X_ts, X_features, groups):
     return y_pred
 
 
-def _drop_rows_with_nans(X_train, y_train):
-    rows_not_na = X_train[REQUIRED_FEATURE_COLS].notna().all(axis=1)
+def preprocess_test_data(X_test, scalers, ret_cols, vol_cols, drop_na=True):
+    X_test = X_test.copy()
+    if drop_na:
+        rows_not_na = X_test[_required_feature_cols(ret_cols, vol_cols)].notna().all(axis=1)
+        dropped_rows = len(X_test) - rows_not_na.sum()
+        X_test = X_test.loc[rows_not_na].copy()
+        logging.info("Dropped %s X_test rows with NaNs.", dropped_rows)
+
+    X_test.loc[:, vol_cols] = _transform_flattened_columns(
+        X_test,
+        vol_cols,
+        scalers["volumes"],
+    )
+    X_test.loc[:, [TURNOVER_COL]] = scalers["turnover"].transform(
+        X_test[[TURNOVER_COL]].to_numpy(dtype=float)
+    )
+
+    X_test_ret = X_test[ret_cols].to_numpy(dtype=float)[:, :, np.newaxis]
+    X_test_vol = X_test[vol_cols].to_numpy(dtype=float)[:, :, np.newaxis]
+    return {
+        "row_ids": X_test.index.to_numpy(),
+        "X_test_ts": np.concatenate((X_test_ret, X_test_vol), axis=2),
+        "X_test_features": X_test[[TURNOVER_COL]].to_numpy(dtype=float),
+        "test_groups": X_test[GROUP_COL].to_numpy(),
+    }
+
+
+def _drop_rows_with_nans(X_train, y_train, ret_cols, vol_cols):
+    rows_not_na = X_train[_required_feature_cols(ret_cols, vol_cols)].notna().all(axis=1)
     dropped_rows = len(X_train) - rows_not_na.sum()
     logging.info("Dropped %s X_train rows with NaNs.", dropped_rows)
     return X_train.loc[rows_not_na].copy(), y_train.loc[rows_not_na].copy()
@@ -253,6 +305,71 @@ def _save_run_config(model_dir, run_args):
     logging.info("Saved run configuration to %s.", config_path)
 
 
+def save_best_models_and_predict_test(
+    best_bundle,
+    model_dir,
+    use_svc,
+    drop_na,
+    ret_cols,
+    vol_cols,
+):
+    best_models_dir = model_dir / "best_models"
+    best_models_dir.mkdir(parents=True, exist_ok=True)
+
+    for group, model in best_bundle["models"].items():
+        model_path = best_models_dir / f"group_{group}.pkl"
+        with model_path.open("wb") as file:
+            pickle.dump(model, file)
+
+    scalers_path = best_models_dir / "scalers.pkl"
+    with scalers_path.open("wb") as file:
+        pickle.dump(best_bundle["scalers"], file)
+
+    metadata_path = best_models_dir / "metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "best_fold": best_bundle["fold"],
+                "best_valid_accuracy": best_bundle["valid_accuracy"],
+                "use_svc": use_svc,
+                "ret_cols": ret_cols,
+                "vol_cols": vol_cols,
+            },
+            file,
+            indent=2,
+        )
+    logging.info(
+        "Saved best fold %s models to %s.",
+        best_bundle["fold"],
+        best_models_dir,
+    )
+
+    X_test = pd.read_csv(RAW_DATA_DIR / "X_test.csv", index_col="ROW_ID")
+    test_data = preprocess_test_data(
+        X_test,
+        best_bundle["scalers"],
+        ret_cols,
+        vol_cols,
+        drop_na=drop_na,
+    )
+    del X_test
+    gc.collect()
+
+    y_pred = predict_group_svms(
+        best_bundle["models"],
+        test_data["X_test_ts"],
+        test_data["X_test_features"],
+        test_data["test_groups"],
+    )
+    submission = pd.read_csv(SAMPLE_SUBMISSION_PATH)
+    predictions = pd.Series(_sign_labels(y_pred), index=test_data["row_ids"])
+    submission.loc[:, "prediction"] = (
+        submission["ROW_ID"].map(predictions).fillna(submission["prediction"]).astype(int)
+    )
+    submission.to_csv(SAMPLE_SUBMISSION_PATH, index=False)
+    logging.info("Saved X_test predictions to %s.", SAMPLE_SUBMISSION_PATH)
+
+
 def run_svm(
     model_name="svm_group_cv",
     use_svc=True,
@@ -260,7 +377,10 @@ def run_svm(
     n_splits=2,
     random_state=42,
     n_rows_per_group=2000,
+    k_last_days=None,
+    predict_test=False,
 ):
+    ret_cols, vol_cols = _feature_columns(k_last_days)
     model_dir = MODELS_DIR / model_name
     model_dir.mkdir(parents=True, exist_ok=True)
     _save_run_config(
@@ -272,6 +392,8 @@ def run_svm(
             "n_splits": n_splits,
             "random_state": random_state,
             "n_rows_per_group": n_rows_per_group,
+            "k_last_days": k_last_days,
+            "predict_test": predict_test,
         },
     )
 
@@ -279,7 +401,7 @@ def run_svm(
     y_train = pd.read_csv(RAW_DATA_DIR / "y_train.csv", index_col="ROW_ID")
 
     if drop_na:
-        X_train, y_train = _drop_rows_with_nans(X_train, y_train)
+        X_train, y_train = _drop_rows_with_nans(X_train, y_train, ret_cols, vol_cols)
 
     X_train, y_train = _sample_rows_per_group(
         X_train,
@@ -296,6 +418,8 @@ def run_svm(
         random_state=random_state,
     )
     cv_scores = []
+    best_bundle = None
+    best_valid_score = -np.inf
 
     for fold, (train_idx, valid_idx) in enumerate(
         splitter.split(X_train, cv_stratification),
@@ -314,6 +438,8 @@ def run_svm(
             X_test=fold_X_valid,
             drop_na=drop_na,
             use_svc=use_svc,
+            ret_cols=ret_cols,
+            vol_cols=vol_cols,
         )
         del fold_X_train, fold_y_train, fold_X_valid
         gc.collect()
@@ -381,9 +507,25 @@ def run_svm(
 
         cv_scores.append(fold_scores | train_group_scores | valid_group_scores)
 
+        if valid_score > best_valid_score:
+            if best_bundle is not None:
+                del best_bundle
+                gc.collect()
+            best_valid_score = valid_score
+            best_bundle = {
+                "fold": fold,
+                "valid_accuracy": valid_score,
+                "models": models,
+                "scalers": data["scalers"],
+            }
+            models = None
+            logging.info("Fold %s is the new best validation fold.", fold)
+
+        if models is not None:
+            del models
+
         del (
             data,
-            models,
             train_pred,
             y_pred,
             fold_y_valid,
@@ -396,9 +538,21 @@ def run_svm(
         gc.collect()
 
     scores = pd.DataFrame(cv_scores)
-    scores_path = model_dir / "svm_group_cv_scores.csv"
+    scores_path = model_dir / "scores.csv"
     scores.to_csv(scores_path, index=False)
     logging.info("Saved cross-validation scores to %s.", scores_path)
+
+    if predict_test:
+        if best_bundle is None:
+            raise ValueError("Cannot predict X_test because no fold model was fitted.")
+        save_best_models_and_predict_test(
+            best_bundle,
+            model_dir,
+            use_svc=use_svc,
+            drop_na=drop_na,
+            ret_cols=ret_cols,
+            vol_cols=vol_cols,
+        )
 
 
 if __name__ == "__main__":
