@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, r2_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import MinMaxScaler
 
@@ -357,18 +357,29 @@ def run_svm(
             train_score,
             valid_score,
         )
-        cv_scores.append(
-            {
-                "fold": fold,
-                "train_accuracy": train_score,
-                "valid_accuracy": valid_score,
-                "n_train": len(train_idx),
-                "n_valid": len(valid_idx),
-                "n_models": len(models),
+        fold_scores = {
+            "fold": fold,
+            "train_accuracy": train_score,
+            "valid_accuracy": valid_score,
+            "n_train": len(train_idx),
+            "n_valid": len(valid_idx),
+            "n_models": len(models),
+        }
+        if not use_svc:
+            train_r2 = r2_score(data["y_train_raw"], train_pred)
+            valid_r2 = r2_score(fold_y_valid, y_pred)
+            logging.info(
+                "Fold %s train R2: %.6f, validation R2: %.6f",
+                fold,
+                train_r2,
+                valid_r2,
+            )
+            fold_scores |= {
+                "train_r2": train_r2,
+                "valid_r2": valid_r2,
             }
-            | train_group_scores
-            | valid_group_scores
-        )
+
+        cv_scores.append(fold_scores | train_group_scores | valid_group_scores)
 
         del (
             data,
@@ -378,6 +389,7 @@ def run_svm(
             fold_y_valid,
             train_idx,
             valid_idx,
+            fold_scores,
             train_group_scores,
             valid_group_scores,
         )
@@ -391,4 +403,4 @@ def run_svm(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-    run_svm(model_name="svr_group", n_rows_per_group=2000, use_svc=False, n_splits=2)
+    run_svm(n_rows_per_group=4000, use_svc=True, n_splits=2)

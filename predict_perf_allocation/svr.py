@@ -27,8 +27,8 @@ class SVMRegTS(RegressorMixin, BaseEstimator):
 
     The estimator follows the scikit-learn API and delegates the optimization to
     :class:`sklearn.svm.SVR` with a precomputed kernel. The final kernel is a
-    convex combination of a Soft-DTW time-series kernel and an RBF kernel built
-    from tabular features Xf.
+    additive or multiplicative combination of a Soft-DTW time-series kernel and
+    an RBF kernel built from tabular features Xf.
     """
 
     def __init__(
@@ -40,6 +40,7 @@ class SVMRegTS(RegressorMixin, BaseEstimator):
         rho=0.0,
         rbf_gamma=1.0,
         alpha=0.5,
+        kernel_combination="additive",
         max_kernel_memory_bytes=None,
         max_kernel_memory_fraction=None,
         max_memory_usage_fraction=None,
@@ -51,6 +52,7 @@ class SVMRegTS(RegressorMixin, BaseEstimator):
         self.rho = rho
         self.rbf_gamma = rbf_gamma
         self.alpha = alpha
+        self.kernel_combination = kernel_combination
         self.max_kernel_memory_bytes = max_kernel_memory_bytes
         self.max_kernel_memory_fraction = max_kernel_memory_fraction
         self.max_memory_usage_fraction = max_memory_usage_fraction
@@ -86,10 +88,14 @@ class SVMRegTS(RegressorMixin, BaseEstimator):
         self.n_timestamps_in_ = X.shape[1]
         self.n_features_Xf_in_ = Xf.shape[1]
         self.alpha_ = self._validate_alpha()
+        self.kernel_combination_ = self._validate_kernel_combination()
         self.soft_dtw_gamma_ = self._validate_kernel_gamma(
             self.soft_dtw_gamma, "soft_dtw_gamma"
         )
-        self.rbf_gamma_ = None if self.alpha_ == 0.0 else self._resolve_rbf_gamma(Xf)
+        if self.kernel_combination_ == "additive" and self.alpha_ == 0.0:
+            self.rbf_gamma_ = None
+        else:
+            self.rbf_gamma_ = self._resolve_rbf_gamma(Xf)
 
         K = self._kernel(X, Xf=Xf)
         self.svr_ = self._make_svr()
@@ -160,11 +166,14 @@ class SVMRegTS(RegressorMixin, BaseEstimator):
                 gak_max,
             )
 
-        if self.alpha_ == 0.0:
+        if self.kernel_combination_ == "additive" and self.alpha_ == 0.0:
             kernel = gak
         else:
             rbf = rbf_kernel(Xf, Yf, gamma=self.rbf_gamma_)
-            kernel = (1.0 - self.alpha_) * gak + self.alpha_ * rbf
+            if self.kernel_combination_ == "additive":
+                kernel = (1.0 - self.alpha_) * gak + self.alpha_ * rbf
+            else:
+                kernel = gak * rbf
 
         if Y is None:
             np.fill_diagonal(kernel, 1.0)
@@ -228,6 +237,13 @@ class SVMRegTS(RegressorMixin, BaseEstimator):
         if not np.isfinite(self.alpha) or not 0 <= self.alpha <= 1:
             raise ValueError("alpha must be a finite value between 0 and 1.")
         return float(self.alpha)
+
+    def _validate_kernel_combination(self):
+        if self.kernel_combination not in {"additive", "multiplicative"}:
+            raise ValueError(
+                "kernel_combination must be either 'additive' or 'multiplicative'."
+            )
+        return self.kernel_combination
 
     def _validate_kernel_gamma(self, gamma, name):
         if not np.isfinite(gamma) or gamma < 0:
