@@ -17,15 +17,18 @@ RET_COLS = [f"RET_{i}" for i in range(20, 0, -1)]
 VOL_COLS = [f"SIGNED_VOLUME_{i}" for i in range(20, 0, -1)]
 TURNOVER_COL = "MEDIAN_DAILY_TURNOVER"
 GROUP_COL = "GROUP"
+TS_COL = "TS"
 TARGET_COL = "target"
+SCORE_DECIMALS = 3
 SVM_PARAMS = {
-    "C": 1.0,
+    "C": 0.1,
     "soft_dtw_gamma": 0.1,
     "lambda_": 1.0,
-    "rbf_gamma": "auto",
+    "rbf_gamma": 1.0,
     "alpha": 0.0,
-    "random_state": 42,
-    "max_memory_usage_fraction": 0.85,
+    "kernel_combination": "multiplicative",
+    "random_state": 1984,
+    "max_memory_usage_fraction": 0.85
 }
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +53,35 @@ def _fit_transform_column(df, col):
     scaler = MinMaxScaler()
     values = df[[col]].to_numpy(dtype=float)
     return scaler.fit_transform(values), scaler
+
+
+def _turnover_imputation_values(X_train):
+    group_means = X_train.groupby(GROUP_COL)[TURNOVER_COL].mean()
+    global_mean = X_train[TURNOVER_COL].mean()
+    if pd.isna(global_mean):
+        raise ValueError(f"Cannot impute {TURNOVER_COL}: all training values are NaN.")
+    return {
+        "group_means": group_means,
+        "global_mean": global_mean,
+    }
+
+
+def _impute_turnover_by_group(df, imputation_values, dataset_name):
+    missing_turnover = df[TURNOVER_COL].isna()
+    if not missing_turnover.any():
+        return df
+
+    group_means = imputation_values["group_means"]
+    global_mean = imputation_values["global_mean"]
+    imputed_values = df.loc[missing_turnover, GROUP_COL].map(group_means).fillna(global_mean)
+    df.loc[missing_turnover, TURNOVER_COL] = imputed_values.to_numpy(dtype=float)
+    logging.info(
+        "Imputed %s %s NaNs with %s means.",
+        missing_turnover.sum(),
+        dataset_name,
+        GROUP_COL,
+    )
+    return df
 
 
 def _feature_columns(k_last_days):
@@ -88,8 +120,21 @@ def preprocess_data(
         y_train = y_train.loc[rows_not_na, TARGET_COL]
         X_train = X_train.loc[rows_not_na].copy()
         logging.info("Dropped %s X_train rows with NaNs.", dropped_rows)
+        turnover_imputation_values = None
     else:
         y_train = y_train.loc[X_train.index, TARGET_COL]
+        turnover_imputation_values = _turnover_imputation_values(X_train)
+        X_train = _impute_turnover_by_group(
+            X_train,
+            turnover_imputation_values,
+            "X_train",
+        )
+        if X_test is not None:
+            X_test = _impute_turnover_by_group(
+                X_test,
+                turnover_imputation_values,
+                "X_test",
+            )
 
     X_train.loc[:, vol_cols], vol_scaler = _fit_transform_flattened_columns(X_train, vol_cols)
     X_train.loc[:, [TURNOVER_COL]], turnover_scaler = _fit_transform_column(X_train, TURNOVER_COL)
@@ -122,6 +167,7 @@ def preprocess_data(
     scalers = {
         "volumes": vol_scaler,
         "turnover": turnover_scaler,
+        "turnover_imputation": turnover_imputation_values,
     }
     return {
         "X_train_ts": X_train_ts,
@@ -197,6 +243,12 @@ def preprocess_test_data(X_test, scalers, ret_cols, vol_cols, drop_na=True):
         dropped_rows = len(X_test) - rows_not_na.sum()
         X_test = X_test.loc[rows_not_na].copy()
         logging.info("Dropped %s X_test rows with NaNs.", dropped_rows)
+    else:
+        X_test = _impute_turnover_by_group(
+            X_test,
+            scalers["turnover_imputation"],
+            "X_test",
+        )
 
     X_test.loc[:, vol_cols] = _transform_flattened_columns(
         X_test,
@@ -241,24 +293,31 @@ def _cv_stratification_labels(X_train, y_binary):
 
 
 def _sample_rows_per_group(X_train, y_train, n_rows_per_group, random_state):
-    if n_rows_per_group is None:
-        return X_train, y_train
-    if not isinstance(n_rows_per_group, int):
-        raise ValueError("n_rows_per_group must be a positive integer or None.")
-    if n_rows_per_group <= 0:
-        raise ValueError("n_rows_per_group must be a positive integer or None.")
+    if n_rows_per_group is not None:
+        if not isinstance(n_rows_per_group, int):
+            raise ValueError("n_rows_per_group must be a positive integer or None.")
+        if n_rows_per_group <= 0:
+            raise ValueError("n_rows_per_group must be a positive integer or None.")
 
     sampled_indexes = []
     row_counts = []
     for group, group_data in X_train.groupby(GROUP_COL, sort=True):
-        n_selected = min(n_rows_per_group, len(group_data))
-        sampled_index = group_data.sample(n=n_selected, random_state=random_state).index
+        n_selected = len(group_data)
+        if n_rows_per_group is not None:
+            n_selected = min(n_rows_per_group, len(group_data))
+            sampled_index = group_data.sample(n=n_selected, random_state=random_state).index
+        else:
+            sampled_index = group_data.index
+
+        selected_targets = y_train.loc[sampled_index, TARGET_COL]
         sampled_indexes.append(sampled_index)
         row_counts.append(
             {
                 GROUP_COL: group,
                 "available_rows": len(group_data),
                 "selected_rows": n_selected,
+                "positive_targets": (selected_targets > 0).sum(),
+                "negative_targets": (selected_targets <= 0).sum(),
             }
         )
 
@@ -275,12 +334,68 @@ def _sample_rows_per_group(X_train, y_train, n_rows_per_group, random_state):
     )
     for counts in row_counts:
         logging.info(
-            "Group %s rows: selected %s/%s.",
+            "Group %s rows: selected %s/%s, positive targets: %s, negative targets: %s.",
             counts[GROUP_COL],
             counts["selected_rows"],
             counts["available_rows"],
+            counts["positive_targets"],
+            counts["negative_targets"],
         )
     return X_train_sampled, y_train_sampled
+
+
+def _date_number_from_ts(ts_values):
+    ts_numbers = ts_values.astype("string").str.extract(r"^DATE_(\d+)$", expand=False)
+    if ts_numbers.isna().any():
+        invalid_values = sorted(ts_values.loc[ts_numbers.isna()].astype(str).unique())
+        invalid_preview = ", ".join(invalid_values[:5])
+        raise ValueError(
+            f"{TS_COL} values must have format 'DATE_XXXX'. "
+            f"Invalid values include: {invalid_preview}"
+        )
+    return ts_numbers.astype(int)
+
+
+def _validate_timestamp_bound(bound, bound_name):
+    if bound is None:
+        return
+    if not isinstance(bound, int):
+        raise ValueError(f"{bound_name} must be an integer or None.")
+    if bound < 0:
+        raise ValueError(f"{bound_name} must be a non-negative integer or None.")
+
+
+def _filter_rows_by_timestamp_window(X_train, y_train, T0, T1):
+    if T0 is None and T1 is None:
+        return X_train, y_train
+
+    _validate_timestamp_bound(T0, "T0")
+    _validate_timestamp_bound(T1, "T1")
+    if T0 is not None and T1 is not None and T0 > T1:
+        raise ValueError("T0 must be less than or equal to T1.")
+
+    ts_numbers = _date_number_from_ts(X_train[TS_COL])
+    rows_in_window = pd.Series(True, index=X_train.index)
+    if T0 is not None:
+        rows_in_window &= ts_numbers >= T0
+    if T1 is not None:
+        rows_in_window &= ts_numbers <= T1
+
+    lower_bound = "-inf" if T0 is None else f"DATE_{T0:04d}"
+    upper_bound = "+inf" if T1 is None else f"DATE_{T1:04d}"
+    logging.info(
+        "Kept %s/%s X_train rows with %s between %s and %s.",
+        rows_in_window.sum(),
+        len(X_train),
+        TS_COL,
+        lower_bound,
+        upper_bound,
+    )
+    if not rows_in_window.any():
+        raise ValueError(
+            f"No X_train rows found with {TS_COL} between {lower_bound} and {upper_bound}."
+        )
+    return X_train.loc[rows_in_window].copy(), y_train.loc[rows_in_window].copy()
 
 
 def _group_accuracy_scores(y_true, y_pred, groups, prefix):
@@ -330,7 +445,7 @@ def save_best_models_and_predict_test(
         json.dump(
             {
                 "best_fold": best_bundle["fold"],
-                "best_valid_accuracy": best_bundle["valid_accuracy"],
+                "best_valid_accuracy": round(best_bundle["valid_accuracy"], SCORE_DECIMALS),
                 "use_svc": use_svc,
                 "ret_cols": ret_cols,
                 "vol_cols": vol_cols,
@@ -379,6 +494,8 @@ def run_svm(
     n_rows_per_group=2000,
     k_last_days=None,
     predict_test=False,
+    T0=None,
+    T1=None,
 ):
     ret_cols, vol_cols = _feature_columns(k_last_days)
     model_dir = MODELS_DIR / model_name
@@ -394,11 +511,15 @@ def run_svm(
             "n_rows_per_group": n_rows_per_group,
             "k_last_days": k_last_days,
             "predict_test": predict_test,
+            "T0": T0,
+            "T1": T1,
         },
     )
 
     X_train = pd.read_csv(RAW_DATA_DIR / "X_train.csv", index_col="ROW_ID")
     y_train = pd.read_csv(RAW_DATA_DIR / "y_train.csv", index_col="ROW_ID")
+
+    X_train, y_train = _filter_rows_by_timestamp_window(X_train, y_train, T0, T1)
 
     if drop_na:
         X_train, y_train = _drop_rows_with_nans(X_train, y_train, ret_cols, vol_cols)
@@ -417,6 +538,12 @@ def run_svm(
         shuffle=True,
         random_state=random_state,
     )
+    train_on_smaller_cv_fold = n_splits > 2
+    if train_on_smaller_cv_fold:
+        logging.warning(
+            "n_splits > 2: training on the smaller fold and validating on the larger split."
+        )
+
     cv_scores = []
     best_bundle = None
     best_valid_score = -np.inf
@@ -426,6 +553,9 @@ def run_svm(
         start=1,
     ):
         logging.info("Starting fold %s/%s.", fold, n_splits)
+
+        if train_on_smaller_cv_fold:
+            train_idx, valid_idx = valid_idx, train_idx
 
         fold_X_train = X_train.iloc[train_idx].copy()
         fold_y_train = y_train.iloc[train_idx].copy()
@@ -478,7 +608,7 @@ def run_svm(
             prefix="valid",
         )
         logging.info(
-            "Fold %s train accuracy: %.6f, validation accuracy: %.6f",
+            "Fold %s train accuracy: %.3f, validation accuracy: %.3f",
             fold,
             train_score,
             valid_score,
@@ -495,7 +625,7 @@ def run_svm(
             train_r2 = r2_score(data["y_train_raw"], train_pred)
             valid_r2 = r2_score(fold_y_valid, y_pred)
             logging.info(
-                "Fold %s train R2: %.6f, validation R2: %.6f",
+                "Fold %s train R2: %.3f, validation R2: %.3f",
                 fold,
                 train_r2,
                 valid_r2,
@@ -537,9 +667,9 @@ def run_svm(
         )
         gc.collect()
 
-    scores = pd.DataFrame(cv_scores)
+    scores = pd.DataFrame(cv_scores).round(SCORE_DECIMALS)
     scores_path = model_dir / "scores.csv"
-    scores.to_csv(scores_path, index=False)
+    scores.to_csv(scores_path, index=False, float_format="%.3f")
     logging.info("Saved cross-validation scores to %s.", scores_path)
 
     if predict_test:
@@ -557,4 +687,15 @@ def run_svm(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-    run_svm(n_rows_per_group=4000, use_svc=True, n_splits=2)
+    run_svm(
+        model_name="svc_prod_kernel",
+        use_svc=True,
+        drop_na=False,
+        n_splits=2,
+        random_state=42,
+        n_rows_per_group=10000,
+        k_last_days=None,
+        predict_test=False,
+        T0=1,
+        T1=1,
+    )
