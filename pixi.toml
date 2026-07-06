@@ -22,6 +22,7 @@ seaborn = ">=0.13.2,<0.14"
 lightgbm = ">=4.6.0,<5"
 numba = ">=0.65.1,<0.66"
 pyamg = ">=5.3.0,<6"
+networkx = ">=3.6.1,<4"
 
 [pypi-dependencies]
 python-dotenv = "*"

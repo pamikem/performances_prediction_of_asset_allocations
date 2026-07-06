@@ -4,7 +4,9 @@ import os
 import pickle
 from pathlib import Path
 
+import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -20,6 +22,7 @@ VOL_COLS = [f"SIGNED_VOLUME_{i}" for i in range(20, 0, -1)]
 GROUP_COL = "GROUP"
 TS_COL = "TS"
 ALLOCATION_COL = "ALLOCATION"
+TARGET_COL = "target"
 SOFT_DTW_PARAMS = {
     "soft_dtw_gamma": 0.1,
     "lambda_": 1.0,
@@ -27,6 +30,10 @@ SOFT_DTW_PARAMS = {
 }
 MEMORY_PARAMS = {
     "max_memory_usage_fraction": 0.85,
+}
+GRAPH_PARAMS = {
+    "n_neighbors": 2,
+    "show_node_labels": False,
 }
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +73,7 @@ def _save_run_config(model_dir, run_args):
         "run_clustering_args": run_args,
         "soft_dtw_params": SOFT_DTW_PARAMS,
         "memory_params": MEMORY_PARAMS,
+        "graph_params": GRAPH_PARAMS,
     }
     config_path = model_dir / "run_config.json"
     with config_path.open("w", encoding="utf-8") as file:
@@ -121,6 +129,107 @@ def _save_affinity_heatmap(model_dir, affinity, labels):
     fig.savefig(heatmap_path, dpi=200)
     plt.close(fig)
     logging.info("Saved affinity matrix heatmap to %s.", heatmap_path)
+
+
+def compute_adjacency_matrix(affinity):
+    """Build an unweighted top-k neighborhood adjacency matrix from affinities."""
+    affinity = np.asarray(affinity, dtype=float)
+    if affinity.ndim != 2 or affinity.shape[0] != affinity.shape[1]:
+        raise ValueError("affinity must be a square 2D matrix.")
+
+    n_samples = affinity.shape[0]
+    adjacency = np.zeros_like(affinity, dtype=float)
+    if n_samples <= 1:
+        return adjacency
+
+    n_neighbors = GRAPH_PARAMS["n_neighbors"]
+    if n_neighbors is None:
+        n_neighbors = int(np.log(n_samples)) + 1
+    elif not isinstance(n_neighbors, int) or n_neighbors <= 0:
+        raise ValueError("GRAPH_PARAMS n_neighbors must be a positive integer or None.")
+
+    n_neighbors = min(n_neighbors, n_samples - 1)
+    affinity_without_self = affinity.copy()
+    np.fill_diagonal(affinity_without_self, -np.inf)
+
+    neighbor_indexes = np.argpartition(
+        affinity_without_self,
+        kth=n_samples - n_neighbors - 1,
+        axis=1,
+    )[:, -n_neighbors:]
+    row_indexes = np.arange(n_samples)[:, np.newaxis]
+    adjacency[row_indexes, neighbor_indexes] = 1.0
+    adjacency = np.maximum(adjacency, adjacency.T)
+    np.fill_diagonal(adjacency, 0.0)
+
+    return adjacency
+
+
+def _save_neighborhood_graph(model_dir, adjacency, target_values, ts_values, random_state):
+    graph = nx.from_numpy_array(adjacency)
+    target_values = np.asarray(target_values, dtype=float)
+    node_colors = np.where(target_values > 0, "green", "red")
+    node_labels = _timestamp_node_labels(ts_values)
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    positions = nx.spring_layout(graph, seed=random_state)
+    nx.draw_networkx_edges(
+        graph,
+        positions,
+        ax=ax,
+        edge_color="#b0b0b0",
+        alpha=0.35,
+        width=0.8,
+    )
+    nx.draw_networkx_nodes(
+        graph,
+        positions,
+        ax=ax,
+        node_color=node_colors,
+        node_size=120 if GRAPH_PARAMS["show_node_labels"] else 40,
+        linewidths=0.2,
+        edgecolors="white",
+    )
+    if GRAPH_PARAMS["show_node_labels"]:
+        nx.draw_networkx_labels(
+            graph,
+            positions,
+            labels=node_labels,
+            ax=ax,
+            font_size=7,
+            font_color="black",
+        )
+    ax.legend(
+        handles=[
+            mpatches.Patch(color="green", label="target > 0"),
+            mpatches.Patch(color="red", label="target <= 0"),
+        ],
+        loc="best",
+    )
+    ax.set_title("Neighborhood graph from GAK affinities")
+    ax.set_axis_off()
+    fig.tight_layout()
+
+    graph_path = model_dir / "neighborhood_graph.png"
+    fig.savefig(graph_path, dpi=200)
+    plt.close(fig)
+    logging.info("Saved neighborhood graph to %s.", graph_path)
+
+
+def _target_values_for_rows(y_train, row_index):
+    _check_columns(y_train, [TARGET_COL])
+    missing_rows = row_index.difference(y_train.index)
+    if len(missing_rows) > 0:
+        raise ValueError("y_train is missing targets for selected X_train rows.")
+    return y_train.loc[row_index, TARGET_COL].to_numpy(dtype=float)
+
+
+def _timestamp_node_labels(ts_values):
+    ts_values = pd.Series(ts_values).astype("string")
+    extracted_numbers = ts_values.str.extract(r"^DATE_(\d+)$", expand=False)
+    labels = extracted_numbers.astype("Int64").astype("string")
+    labels = labels.fillna(ts_values)
+    return dict(enumerate(labels.astype(str)))
 
 
 def _drop_rows_with_nans(X_train):
@@ -200,6 +309,46 @@ def _validate_timestamp_bound(bound, bound_name):
         raise ValueError(f"{bound_name} must be an integer or None.")
     if bound < 0:
         raise ValueError(f"{bound_name} must be a non-negative integer or None.")
+
+
+def _allocation_name_from_id(allocation_id):
+    if allocation_id is None:
+        return None
+    if not isinstance(allocation_id, int):
+        raise ValueError("allocation_id must be an integer or None.")
+    if allocation_id < 0:
+        raise ValueError("allocation_id must be a non-negative integer or None.")
+    return f"ALLOCATION_{allocation_id:02d}"
+
+
+def _filter_rows_by_allocation(X_train, allocation_id, n_clusters):
+    allocation_name = _allocation_name_from_id(allocation_id)
+    if allocation_name is None:
+        return X_train
+
+    _check_columns(X_train, [ALLOCATION_COL])
+    rows_for_allocation = X_train[ALLOCATION_COL] == allocation_name
+    n_rows = rows_for_allocation.sum()
+    if n_rows < n_clusters:
+        logger.warning(
+            "Allocation %s has only %s rows, fewer than n_clusters=%s. Stopping clustering.",
+            allocation_name,
+            n_rows,
+            n_clusters,
+        )
+        raise ValueError(
+            f"Allocation {allocation_name} has only {n_rows} rows, "
+            f"fewer than n_clusters={n_clusters}."
+        )
+
+    logging.info(
+        "Kept %s/%s X_train rows for %s=%s.",
+        n_rows,
+        len(X_train),
+        ALLOCATION_COL,
+        allocation_name,
+    )
+    return X_train.loc[rows_for_allocation].copy()
 
 
 def _filter_rows_by_timestamp_window(X_train, T0, T1):
@@ -345,6 +494,8 @@ def run_clustering(
     n_rows_per_group=2000,
     T0=None,
     T1=None,
+    allocation_id=None,
+    plot_graph=False,
 ):
     """Cluster rows in ``data/raw/X_train.csv`` with GAK spectral clustering.
 
@@ -355,13 +506,17 @@ def run_clustering(
     drop_na : bool, default=True
         Drop rows with NaNs in return or volume columns before clustering.
     random_state : int, default=42
-        Random seed passed to sampling and ``SpectralClustering``.
+        Random seed passed to sampling, ``SpectralClustering``, and graph layout.
     n_rows_per_group : int or None, default=2000
         Maximum number of rows to sample from each ``GROUP``. If None, use all rows.
     T0 : int or None, default=None
         Lower inclusive timestamp bound for ``TS`` values formatted as ``DATE_XXXX``.
     T1 : int or None, default=None
         Upper inclusive timestamp bound for ``TS`` values formatted as ``DATE_XXXX``.
+    allocation_id : int or None, default=None
+        If set, keep only rows where ``ALLOCATION`` equals ``ALLOCATION_XX``.
+    plot_graph : bool, default=False
+        If True, compute an unweighted neighborhood graph and save it as a PNG.
 
     Results are saved under ``models/clustering``.
     """
@@ -378,21 +533,28 @@ def run_clustering(
             "n_rows_per_group": n_rows_per_group,
             "T0": T0,
             "T1": T1,
+            "allocation_id": allocation_id,
+            "plot_graph": plot_graph,
         },
     )
 
     X_train = pd.read_csv(RAW_DATA_DIR / "X_train.csv", index_col="ROW_ID")
+    y_train = pd.read_csv(RAW_DATA_DIR / "y_train.csv", index_col="ROW_ID")
     _check_columns(X_train, [TS_COL, ALLOCATION_COL])
     X_train = _filter_rows_by_timestamp_window(X_train, T0, T1)
+    X_train = _filter_rows_by_allocation(X_train, allocation_id, n_clusters)
 
     if drop_na:
         X_train = _drop_rows_with_nans(X_train)
 
-    X_train = _sample_rows_per_group(
-        X_train,
-        n_rows_per_group=n_rows_per_group,
-        random_state=1984
-    )
+    if allocation_id is None:
+        X_train = _sample_rows_per_group(
+            X_train,
+            n_rows_per_group=n_rows_per_group,
+            random_state=1984,
+        )
+    else:
+        logging.info("Skipped per-group sampling because allocation_id is set.")
 
     if n_clusters > len(X_train):
         raise ValueError("n_clusters cannot exceed the number of rows in X_train.")
@@ -404,10 +566,21 @@ def run_clustering(
         eigen_solver=None,
         affinity="precomputed",
         random_state=random_state,
-        assign_labels="cluster_qr"
+        assign_labels="cluster_qr",
     )
     labels = model.fit_predict(affinity)
     _save_clustering_outputs(CLUSTERING_MODEL_DIR, X_train, labels, affinity)
+
+    if plot_graph:
+        adjacency = compute_adjacency_matrix(affinity)
+        target_values = _target_values_for_rows(y_train, X_train.index)
+        _save_neighborhood_graph(
+            CLUSTERING_MODEL_DIR,
+            adjacency,
+            target_values,
+            X_train[TS_COL].to_numpy(),
+            random_state,
+        )
 
 
 if __name__ == "__main__":
@@ -417,6 +590,8 @@ if __name__ == "__main__":
         drop_na=False,
         random_state=42,
         n_rows_per_group=500,
-        T0=1,
-        T1=2
+        T0=None,
+        T1=None,
+        allocation_id=94,
+        plot_graph=False
     )
