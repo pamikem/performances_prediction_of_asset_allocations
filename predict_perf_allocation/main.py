@@ -26,7 +26,7 @@ SVM_PARAMS = {
     "lambda_": 1.0,
     "rbf_gamma": 1.0,
     "alpha": 0.0,
-    "kernel_combination": "multiplicative",
+    "kernel_combination": "additive",
     "random_state": 1984,
     "max_memory_usage_fraction": 0.85
 }
@@ -688,14 +688,14 @@ def run_svm(
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     run_svm(
-        model_name="svc_prod_kernel",
+        model_name="svc_add_kernel",
         use_svc=True,
         drop_na=False,
         n_splits=2,
         random_state=42,
-        n_rows_per_group=10000,
+        n_rows_per_group=5000,
         k_last_days=None,
         predict_test=False,
-        T0=1,
-        T1=2,
+        T0=None,
+        T1=None,
     )
