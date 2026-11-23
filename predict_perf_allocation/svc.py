@@ -184,7 +184,7 @@ class SVMTS(ClassifierMixin, BaseEstimator):
         n_y = X.shape[0] if Y is None else Y.shape[0]
         self._check_kernel_memory_budget(X.shape[0], n_y)
         distances = self._distance(X, Y)
-        gak = np.exp(-self.soft_dtw_gamma_ * distances)
+        gak = np.exp(- distances / self.soft_dtw_gamma_ )
         gak_max = np.max(gak)
         if gak_max > 2:
             logger.warning(

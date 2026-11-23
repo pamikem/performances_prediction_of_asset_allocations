@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import pickle
+from time import perf_counter
 from pathlib import Path
 
 import matplotlib.patches as mpatches
@@ -11,6 +12,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.cluster import SpectralClustering
+from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import MinMaxScaler
 
 from predict_perf_allocation.soft_dtw import SoftDTW
@@ -26,7 +28,7 @@ TARGET_COL = "target"
 SOFT_DTW_PARAMS = {
     "soft_dtw_gamma": 0.1,
     "lambda_": 1.0,
-    "rho": 0.1,
+    "rho": 0.0,
 }
 MEMORY_PARAMS = {
     "max_memory_usage_fraction": 0.85,
@@ -39,7 +41,7 @@ GRAPH_PARAMS = {
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 MODELS_DIR = PROJECT_ROOT / "models"
-CLUSTERING_MODEL_DIR = MODELS_DIR / "clustering"
+CLUSTERING_RUN_PREFIX = "clustering_run_"
 
 
 def _check_columns(X_train, columns):
@@ -61,11 +63,31 @@ def _scale_volumes(X_train, vol_cols):
     return scaled_volumes
 
 
-def _time_series_from_x_train(X_train):
-    returns = X_train[RET_COLS].to_numpy(dtype=float)
-    volumes = _scale_volumes(X_train, VOL_COLS)
+def _time_series_feature_columns(time_series_features):
+    if time_series_features not in {"returns", "volumes", "both"}:
+        raise ValueError(
+            "time_series_features must be 'returns', 'volumes', or 'both'."
+        )
 
-    return np.stack((returns, volumes), axis=2)
+    feature_cols = []
+    if time_series_features in {"returns", "both"}:
+        feature_cols.extend(RET_COLS)
+    if time_series_features in {"volumes", "both"}:
+        feature_cols.extend(VOL_COLS)
+    return feature_cols
+
+
+def _time_series_from_x_train(X_train, time_series_features="both"):
+    _time_series_feature_columns(time_series_features)
+    series = []
+    if time_series_features in {"returns", "both"}:
+        _check_columns(X_train, RET_COLS)
+        series.append(X_train[RET_COLS].to_numpy(dtype=float))
+    if time_series_features in {"volumes", "both"}:
+        _check_columns(X_train, VOL_COLS)
+        series.append(_scale_volumes(X_train, VOL_COLS))
+
+    return np.stack(series, axis=2)
 
 
 def _save_run_config(model_dir, run_args):
@@ -81,22 +103,66 @@ def _save_run_config(model_dir, run_args):
     logging.info("Saved run configuration to %s.", config_path)
 
 
-def _save_clustering_outputs(model_dir, X_train, labels, affinity):
+def _create_clustering_run_dir():
+    """Create the next incrementally numbered clustering run directory."""
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    run_ids = []
+    for path in MODELS_DIR.glob(f"{CLUSTERING_RUN_PREFIX}*"):
+        suffix = path.name.removeprefix(CLUSTERING_RUN_PREFIX)
+        if path.is_dir() and suffix.isdigit():
+            run_ids.append(int(suffix))
+
+    run_dir = MODELS_DIR / f"{CLUSTERING_RUN_PREFIX}{max(run_ids, default=0) + 1}"
+    run_dir.mkdir()
+    return run_dir
+
+
+def _save_clustering_outputs(model_dir, X_train, labels):
     _check_columns(X_train, [TS_COL, ALLOCATION_COL])
 
-    labels_df = X_train[[TS_COL, ALLOCATION_COL]].copy()
+    labels_df = X_train[[TS_COL, ALLOCATION_COL, GROUP_COL]].copy()
     labels_df.loc[:, "cluster"] = labels
 
     labels_path = model_dir / "labels.csv"
     labels_df.to_csv(labels_path, index=True)
     logging.info("Saved clustering labels to %s.", labels_path)
 
-    affinity_path = model_dir / "affinity_matrix.pkl"
-    with affinity_path.open("wb") as file:
-        pickle.dump(affinity, file)
-    logging.info("Saved affinity matrix to %s.", affinity_path)
+    # affinity_path = model_dir / "affinity_matrix.pkl"
+    # with affinity_path.open("wb") as file:
+    #     pickle.dump(affinity, file)
+    # logging.info("Saved affinity matrix to %s.", affinity_path)
 
-    _save_affinity_heatmap(model_dir, affinity, labels)
+    # _save_affinity_heatmap(model_dir, affinity, labels)
+
+
+def _append_clustering_metrics(group_scores, run_id):
+    """Append one silhouette score per GROUP under the current run ID."""
+    metrics = pd.DataFrame(
+        group_scores,
+        index=pd.Index([run_id] * len(group_scores), name="run_id"),
+    )
+
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_path = MODELS_DIR / "clustering_metrics.csv"
+    if metrics_path.exists():
+        previous_header = pd.read_csv(metrics_path, nrows=0).columns
+        index_col = "run_id" if "run_id" in previous_header else None
+        previous_metrics = pd.read_csv(metrics_path, index_col=index_col)
+        if previous_metrics.index.name != "run_id":
+            previous_metrics.index = pd.RangeIndex(
+                start=1,
+                stop=len(previous_metrics) + 1,
+                name="run_id",
+            )
+        if "GROUP" not in previous_metrics.columns:
+            previous_metrics["GROUP"] = np.nan
+        if "silhouette_score" not in previous_metrics.columns:
+            previous_metrics["silhouette_score"] = np.nan
+        previous_metrics = previous_metrics[["GROUP", "silhouette_score"]]
+        metrics = pd.concat([previous_metrics, metrics])
+
+    metrics.to_csv(metrics_path, index=True, index_label="run_id")
+    logging.info("Saved clustering metrics to %s.", metrics_path)
 
 
 def _save_affinity_heatmap(model_dir, affinity, labels):
@@ -165,7 +231,14 @@ def compute_adjacency_matrix(affinity):
     return adjacency
 
 
-def _save_neighborhood_graph(model_dir, adjacency, target_values, ts_values, random_state):
+def _save_neighborhood_graph(
+    model_dir,
+    adjacency,
+    target_values,
+    ts_values,
+    random_state,
+    group,
+):
     graph = nx.from_numpy_array(adjacency)
     target_values = np.asarray(target_values, dtype=float)
     node_colors = np.where(target_values > 0, "green", "red")
@@ -206,7 +279,7 @@ def _save_neighborhood_graph(model_dir, adjacency, target_values, ts_values, ran
         ],
         loc="best",
     )
-    ax.set_title("Neighborhood graph from GAK affinities")
+    ax.set_title(f"Neighborhood graph for {GROUP_COL}={group}")
     ax.set_axis_off()
     fig.tight_layout()
 
@@ -232,8 +305,9 @@ def _timestamp_node_labels(ts_values):
     return dict(enumerate(labels.astype(str)))
 
 
-def _drop_rows_with_nans(X_train):
-    feature_cols = RET_COLS + VOL_COLS
+def _drop_rows_with_nans(X_train, time_series_features="both"):
+    feature_cols = _time_series_feature_columns(time_series_features)
+    _check_columns(X_train, feature_cols)
     rows_not_na = X_train[feature_cols].notna().all(axis=1)
     dropped_rows = len(X_train) - rows_not_na.sum()
     logging.info("Dropped %s X_train rows with NaNs.", dropped_rows)
@@ -457,34 +531,30 @@ def _format_bytes(value):
         value /= 1024
 
 
-def compute_gak_affinity(X_train):
-    """Compute a GAK affinity matrix between rows of ``X_train``.
+def compute_gak_affinity(X_train, time_series_features="both"):
+    """Compute the Soft-DTW distance matrix between rows of ``X_train``.
 
-    Rows are represented as bivariate time series built from all matching
-    ``RET_*`` and scaled ``SIGNED_VOLUME_*`` columns.
+    Rows use the selected return and/or scaled signed-volume time series.
     """
-    _check_columns(X_train, RET_COLS + VOL_COLS)
-
-    X_ts = _time_series_from_x_train(X_train)
+    X_ts = _time_series_from_x_train(X_train, time_series_features)
     _check_gak_memory_budget(X_ts.shape[0])
     soft_dtw_gamma = SOFT_DTW_PARAMS["soft_dtw_gamma"]
+    started_at = perf_counter()
     distances = SoftDTW.pairwise(
         X_ts,
         gamma=soft_dtw_gamma,
         lambda_=SOFT_DTW_PARAMS["lambda_"],
         rho=SOFT_DTW_PARAMS["rho"],
     )
-    affinity = np.exp(-soft_dtw_gamma * distances)
-    affinity_max = np.max(affinity)
-    if affinity_max > 1.0:
-        logger.warning(
-            "GAK affinity matrix contains values exceeding 1.0 "
-            "(soft_dtw_gamma=%s, max=%s).",
-            soft_dtw_gamma,
-            affinity_max,
-        )
-
-    return affinity
+    logger.info(
+        "Soft-DTW pairwise computation took %.3f seconds for %s sequences "
+        "(%s timesteps, %s features).",
+        perf_counter() - started_at,
+        X_ts.shape[0],
+        X_ts.shape[1],
+        X_ts.shape[2],
+    )
+    return distances
 
 
 def run_clustering(
@@ -496,13 +566,14 @@ def run_clustering(
     T1=None,
     allocation_id=None,
     plot_graph=False,
+    time_series_features="both",
 ):
-    """Cluster rows in ``data/raw/X_train.csv`` with GAK spectral clustering.
+    """Cluster each ``GROUP`` independently with GAK spectral clustering.
 
     Parameters
     ----------
     n_clusters : int
-        Number of clusters to fit.
+        Number of clusters to fit independently within each ``GROUP``.
     drop_na : bool, default=True
         Drop rows with NaNs in return or volume columns before clustering.
     random_state : int, default=42
@@ -517,15 +588,20 @@ def run_clustering(
         If set, keep only rows where ``ALLOCATION`` equals ``ALLOCATION_XX``.
     plot_graph : bool, default=False
         If True, compute an unweighted neighborhood graph and save it as a PNG.
+    time_series_features : {"returns", "volumes", "both"}, default="both"
+        Choose which time-series columns to use for distance computation.
 
-    Results are saved under ``models/clustering``.
+    Labels are saved together with their ``GROUP`` values. One silhouette score
+    per group is appended to ``models/clustering_metrics.csv``. Run artifacts
+    are saved under an incrementally numbered ``models/clustering_run_*`` directory.
     """
-    if not isinstance(n_clusters, int) or n_clusters <= 0:
-        raise ValueError("n_clusters must be a positive integer.")
+    if not isinstance(n_clusters, int) or n_clusters < 2:
+        raise ValueError("n_clusters must be an integer of at least 2.")
+    _time_series_feature_columns(time_series_features)
 
-    CLUSTERING_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = _create_clustering_run_dir()
     _save_run_config(
-        CLUSTERING_MODEL_DIR,
+        run_dir,
         {
             "n_clusters": n_clusters,
             "drop_na": drop_na,
@@ -535,6 +611,8 @@ def run_clustering(
             "T1": T1,
             "allocation_id": allocation_id,
             "plot_graph": plot_graph,
+            "time_series_features": time_series_features,
+            "cluster_per_group": True,
         },
     )
 
@@ -545,7 +623,7 @@ def run_clustering(
     X_train = _filter_rows_by_allocation(X_train, allocation_id, n_clusters)
 
     if drop_na:
-        X_train = _drop_rows_with_nans(X_train)
+        X_train = _drop_rows_with_nans(X_train, time_series_features)
 
     if allocation_id is None:
         X_train = _sample_rows_per_group(
@@ -556,42 +634,92 @@ def run_clustering(
     else:
         logging.info("Skipped per-group sampling because allocation_id is set.")
 
-    if n_clusters > len(X_train):
-        raise ValueError("n_clusters cannot exceed the number of rows in X_train.")
+    soft_dtw_gamma = SOFT_DTW_PARAMS["soft_dtw_gamma"]
+    run_id = int(run_dir.name.removeprefix(CLUSTERING_RUN_PREFIX))
+    labels_by_row = {}
+    group_scores = []
+    for group_number, (group, group_X_train) in enumerate(
+        X_train.groupby(GROUP_COL, sort=True, dropna=False),
+        start=1,
+    ):
+        n_group_rows = len(group_X_train)
+        if n_clusters >= n_group_rows:
+            raise ValueError(
+                f"GROUP {group!r} has {n_group_rows} rows; n_clusters={n_clusters} "
+                "must be smaller than the group size to calculate silhouette score."
+            )
 
-    affinity = compute_gak_affinity(X_train)
-
-    model = SpectralClustering(
-        n_clusters=n_clusters,
-        eigen_solver=None,
-        affinity="precomputed",
-        random_state=random_state,
-        assign_labels="cluster_qr",
-    )
-    labels = model.fit_predict(affinity)
-    _save_clustering_outputs(CLUSTERING_MODEL_DIR, X_train, labels, affinity)
-
-    if plot_graph:
-        adjacency = compute_adjacency_matrix(affinity)
-        target_values = _target_values_for_rows(y_train, X_train.index)
-        _save_neighborhood_graph(
-            CLUSTERING_MODEL_DIR,
-            adjacency,
-            target_values,
-            X_train[TS_COL].to_numpy(),
-            random_state,
+        distances = compute_gak_affinity(group_X_train, time_series_features)
+        affinity = np.exp(-distances / soft_dtw_gamma)
+        affinity_min = np.min(affinity)
+        affinity_max = np.max(affinity)
+        logger.info(
+            "GROUP %r affinity range: min=%.8g, max=%.8g",
+            group,
+            affinity_min,
+            affinity_max,
         )
+        if affinity_max > 1.0:
+            logger.warning(
+                "GROUP %r affinity matrix contains values exceeding 1.0 "
+                "(soft_dtw_gamma=%s, max=%s).",
+                group,
+                soft_dtw_gamma,
+                affinity_max,
+            )
+
+        model = SpectralClustering(
+            n_clusters=n_clusters,
+            eigen_solver=None,
+            affinity="precomputed",
+            random_state=random_state,
+            assign_labels="cluster_qr",
+        )
+        labels = model.fit_predict(affinity)
+        labels_by_row.update(zip(group_X_train.index, labels, strict=True))
+
+        silhouette_distances = np.asarray(distances, dtype=float).copy()
+        silhouette_distances -= np.min(silhouette_distances)
+        np.fill_diagonal(silhouette_distances, 0.0)
+        group_scores.append(
+            {
+                GROUP_COL: group,
+                "silhouette_score": silhouette_score(
+                    silhouette_distances,
+                    labels,
+                    metric="precomputed",
+                ),
+            }
+        )
+
+        if plot_graph:
+            group_dir = run_dir / f"group_{group_number:03d}"
+            group_dir.mkdir()
+            adjacency = compute_adjacency_matrix(affinity)
+            target_values = _target_values_for_rows(y_train, group_X_train.index)
+            _save_neighborhood_graph(
+                group_dir,
+                adjacency,
+                target_values,
+                group_X_train[TS_COL].to_numpy(),
+                random_state,
+                group,
+            )
+
+    labels = pd.Series(labels_by_row).reindex(X_train.index).to_numpy()
+    _append_clustering_metrics(group_scores, run_id)
+    _save_clustering_outputs(run_dir, X_train, labels)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
     run_clustering(
         n_clusters=3,
-        drop_na=False,
+        drop_na=True,
         random_state=42,
-        n_rows_per_group=500,
+        n_rows_per_group=2000,
         T0=None,
         T1=None,
-        allocation_id=94,
-        plot_graph=False
+        allocation_id=None,
+        time_series_features='both'
     )
