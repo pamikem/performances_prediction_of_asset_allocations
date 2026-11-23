@@ -3,7 +3,7 @@ from math import exp, log
 from numba import njit, prange, set_num_threads
 import numpy as np
 
-set_num_threads(4)
+set_num_threads(16)
 DBL_MAX = np.finfo(np.float64).max
 
 
@@ -89,13 +89,29 @@ def _pairwise_soft_dtw(X, Y, out, gamma, lambda_, rho):
 def _pairwise_soft_dtw_symmetric(X, out, gamma, lambda_, rho):
     n_series = X.shape[0]
     m = X.shape[1]
+    n_pairs = n_series * (n_series + 1) // 2
 
-    for pair_idx in prange(n_series * n_series):
-        i = pair_idx // n_series
-        j = pair_idx % n_series
-
-        if j < i:
-            continue
+    for pair_idx in prange(n_pairs):
+        # Rows of the upper triangle have lengths n_series, n_series - 1, ...
+        # Invert their cumulative pair count to map the flat index to (i, j).
+        i = int(
+            (2 * n_series + 1 - np.sqrt(
+                (2 * n_series + 1) ** 2 - 8 * pair_idx
+            ))
+            // 2
+        )
+        row_start = i * n_series - i * (i - 1) // 2
+        # Correct any floating-point rounding at triangular-number boundaries.
+        while row_start > pair_idx:
+            i -= 1
+            row_start = i * n_series - i * (i - 1) // 2
+        while i < n_series - 1:
+            next_row_start = (i + 1) * n_series - i * (i + 1) // 2
+            if next_row_start > pair_idx:
+                break
+            i += 1
+            row_start = next_row_start
+        j = i + pair_idx - row_start
 
         D = np.empty((m, m), dtype=np.float64)
         R = np.zeros((m + 2, m + 2), dtype=np.float64)
