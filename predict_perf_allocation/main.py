@@ -7,7 +7,9 @@ import pickle
 import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, r2_score
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import StratifiedKFold
+from sklearn.inspection import permutation_importance
 from sklearn.preprocessing import MinMaxScaler
 
 from predict_perf_allocation.svc import SVMTS
@@ -685,17 +687,211 @@ def run_svm(
         )
 
 
+def run_boosting_tree(
+    pca_run_dir="pca_run_sample",
+    model_name="boosting_tree_group",
+    max_iter=100,
+    n_splits=2,
+    random_state=42,
+):
+    """Fit one HistGradientBoostingRegressor per GROUP using saved KPCA embeddings.
+
+    ``INPUT_ID`` in each embedding file is matched to the ``ROW_ID`` index in
+    ``y_train.csv``. ``GROUP`` is passed as a categorical feature. ``RET_1``,
+    ``MEDIAN_DAILY_TURNOVER``, and the PCA components are numeric features;
+    ``TS``, ``ALLOCATION``, and ``INPUT_ID`` are excluded. Stratified cross
+    validation reports sign accuracy overall and for each GROUP. Models from
+    the fold with the best validation accuracy are saved under
+    ``models/<model_name>``.
+    """
+    pca_dir = Path(pca_run_dir)
+    if not pca_dir.is_absolute():
+        pca_dir = MODELS_DIR / pca_dir
+    embedding_paths = sorted(pca_dir.glob("group_00*/embedding.csv"))
+    if not embedding_paths:
+        raise FileNotFoundError(
+            f"No group embedding files found under {pca_dir} "
+            "(expected group_00*/embedding.csv)."
+        )
+
+    y_train = pd.read_csv(RAW_DATA_DIR / "y_train.csv", index_col="ROW_ID")
+    if TARGET_COL not in y_train.columns:
+        raise ValueError(f"y_train.csv must contain a {TARGET_COL!r} column.")
+
+    model_dir = MODELS_DIR / model_name
+    model_dir.mkdir(parents=True, exist_ok=True)
+    X_parts = []
+    y_parts = []
+    group_parts = []
+
+    for embedding_path in embedding_paths:
+        embedding = pd.read_csv(embedding_path, index_col="INPUT_ID")
+        component_cols = [
+            col for col in embedding.columns if col.startswith("component_")
+        ]
+        if not component_cols:
+            raise ValueError(f"No component_* columns found in {embedding_path}.")
+        if GROUP_COL not in embedding.columns:
+            raise ValueError(f"{embedding_path} must contain a {GROUP_COL!r} column.")
+        if embedding[GROUP_COL].nunique(dropna=False) != 1:
+            raise ValueError(f"{embedding_path} contains multiple GROUP values.")
+
+        embedding.index = pd.to_numeric(embedding.index, errors="raise")
+        aligned_target = y_train[TARGET_COL].reindex(embedding.index)
+        valid = aligned_target.notna()
+        numeric_metadata_cols = ["RET_1", TURNOVER_COL]
+        for feature_col in numeric_metadata_cols:
+            if feature_col not in embedding.columns:
+                raise ValueError(
+                    f"{embedding_path} must contain a {feature_col!r} column."
+                )
+        feature_cols = [
+            GROUP_COL,
+            *numeric_metadata_cols,
+            *component_cols,
+        ]
+        X = embedding.loc[valid, feature_cols].copy()
+        X[GROUP_COL] = X[GROUP_COL].astype("category")
+        y = aligned_target.loc[valid].to_numpy(dtype=float)
+        if len(y) == 0:
+            raise ValueError(f"No matching targets found for {embedding_path}.")
+
+        X_parts.append(X)
+        y_parts.append(pd.Series(y, index=X.index))
+        group_parts.append(embedding.loc[valid, GROUP_COL].reset_index(drop=True))
+
+    X_all = pd.concat(X_parts, ignore_index=True)
+    X_all[GROUP_COL] = X_all[GROUP_COL].astype("category")
+    y_all = pd.concat(y_parts, ignore_index=True).to_numpy(dtype=float)
+    groups = pd.concat(group_parts, ignore_index=True)
+    y_binary = _sign_labels(y_all)
+    stratification = groups.astype(str).to_numpy() + "_" + y_binary.astype(str)
+    splitter = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    cv_scores = []
+    best_models = None
+    best_valid_score = -np.inf
+    for fold, (train_idx, valid_idx) in enumerate(
+        splitter.split(X_all, stratification),
+        start=1,
+    ):
+        fold_models = {}
+        train_predictions = np.empty(len(train_idx), dtype=float)
+        valid_predictions = np.empty(len(valid_idx), dtype=float)
+        train_groups = groups.iloc[train_idx].to_numpy()
+        valid_groups = groups.iloc[valid_idx].to_numpy()
+
+        for group in pd.unique(groups):
+            train_mask = train_groups == group
+            valid_mask = valid_groups == group
+            model = HistGradientBoostingRegressor(
+                max_iter=max_iter,
+                random_state=random_state,
+                categorical_features="from_dtype",
+            )
+            model.fit(X_all.iloc[train_idx[train_mask]], y_all[train_idx[train_mask]])
+            fold_models[group] = model
+            train_predictions[train_mask] = model.predict(
+                X_all.iloc[train_idx[train_mask]]
+            )
+            valid_predictions[valid_mask] = model.predict(
+                X_all.iloc[valid_idx[valid_mask]]
+            )
+            importance = permutation_importance(
+                model,
+                X_all.iloc[valid_idx[valid_mask]],
+                y_all[valid_idx[valid_mask]],
+                scoring="r2",
+                n_repeats=5,
+                n_jobs=2,
+                random_state=random_state,
+            )
+            ranked_importance = sorted(
+                zip(
+                    X_all.columns,
+                    importance.importances_mean,
+                    importance.importances_std,
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            importance_summary = ", ".join(
+                f"{name}={mean:.4f}±{std:.4f}"
+                for name, mean, std in ranked_importance
+            )
+            logging.info(
+                "Fold %s GROUP %r validation permutation importance "
+                "(R² decrease): %s",
+                fold,
+                group,
+                importance_summary,
+            )
+
+        train_y = y_all[train_idx]
+        valid_y = y_all[valid_idx]
+        train_accuracy = _sign_accuracy(train_y, train_predictions)
+        valid_accuracy = _sign_accuracy(valid_y, valid_predictions)
+        fold_scores = {
+            "fold": fold,
+            "train_accuracy": train_accuracy,
+            "valid_accuracy": valid_accuracy,
+            "n_train": len(train_idx),
+            "n_valid": len(valid_idx),
+            "n_models": len(fold_models),
+        }
+        for group in pd.unique(groups):
+            train_group_mask = train_groups == group
+            valid_group_mask = valid_groups == group
+            group_name = str(group)
+            fold_scores[f"train_accuracy_{group_name}"] = _sign_accuracy(
+                train_y[train_group_mask], train_predictions[train_group_mask]
+            )
+            fold_scores[f"valid_accuracy_{group_name}"] = _sign_accuracy(
+                valid_y[valid_group_mask], valid_predictions[valid_group_mask]
+            )
+        cv_scores.append(fold_scores)
+        logging.info(
+            "Fold %s train sign accuracy: %.3f, validation sign accuracy: %.3f",
+            fold,
+            train_accuracy,
+            valid_accuracy,
+        )
+        if valid_accuracy > best_valid_score:
+            best_valid_score = valid_accuracy
+            best_models = fold_models
+
+    pd.DataFrame(cv_scores).round(SCORE_DECIMALS).to_csv(
+        model_dir / "scores.csv",
+        index=False,
+        float_format="%.3f",
+    )
+    with (model_dir / "models.pkl").open("wb") as file:
+        pickle.dump(best_models, file)
+    logging.info("Saved cross-validation scores and best fold models under %s.", model_dir)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-    run_svm(
-        model_name="svc_add_kernel",
-        use_svc=True,
-        drop_na=False,
+    # run_svm(
+    #     model_name="svr_add_kernel",
+    #     use_svc=False,
+    #     drop_na=False,
+    #     n_splits=2,
+    #     random_state=42,
+    #     n_rows_per_group=5000,
+    #     k_last_days=None,
+    #     predict_test=False,
+    #     T0=1,
+    #     T1=3,
+    # )
+    run_boosting_tree(
+        pca_run_dir="pca_run_2",
+        model_name="boosting_tree_group",
+        max_iter=100,
         n_splits=2,
         random_state=42,
-        n_rows_per_group=5000,
-        k_last_days=None,
-        predict_test=False,
-        T0=None,
-        T1=None,
     )
